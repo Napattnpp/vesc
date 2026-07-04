@@ -49,16 +49,21 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
 : Node("vesc_to_odom_node", options),
   odom_frame_("odom"),
   base_frame_("base_link"),
-  use_servo_cmd_(true),
+  heading_source_("servo"),
   publish_tf_(false),
   x_(0.0),
   y_(0.0),
-  yaw_(0.0)
+  yaw_(0.0),
+  last_yaw_rad_(0.0),
+  last_imu_yaw_(0.0),
+  initial_imu_yaw_(0.0),
+  last_imu_angular_vel_z_(0.0),
+  got_initial_imu_(false)
 {
   // get ROS parameters
   odom_frame_ = declare_parameter("odom_frame", odom_frame_);
   base_frame_ = declare_parameter("base_frame", base_frame_);
-  use_servo_cmd_ = declare_parameter("use_servo_cmd_to_calc_angular_velocity", use_servo_cmd_);
+  heading_source_ = declare_parameter("heading_source", heading_source_);
   
   declare_parameter<double>("speed_to_erpm_gain", 0.0);
   declare_parameter<double>("speed_to_erpm_offset", 0.0);
@@ -66,7 +71,7 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   speed_to_erpm_gain_ = get_parameter("speed_to_erpm_gain").get_value<double>();
   speed_to_erpm_offset_ = get_parameter("speed_to_erpm_offset").get_value<double>();
 
-  if (use_servo_cmd_) {
+  if (heading_source_ == "servo") {
     declare_parameter<double>("steering_angle_to_servo_gain", 0.0);
     declare_parameter<double>("steering_angle_to_servo_offset", 0.0);
     declare_parameter<double>("wheelbase", 0.0);
@@ -86,20 +91,28 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
     tf_pub_.reset(new tf2_ros::TransformBroadcaster(this));
   }
 
-  // subscribe to vesc state and. optionally, servo command
+  // subscribe to vesc state and, optionally, servo command or IMU data
   vesc_state_sub_ = create_subscription<VescStateStamped>(
     "sensors/core", 10, std::bind(&VescToOdom::vescStateCallback, this, _1));
 
-  if (use_servo_cmd_) {
+  if (heading_source_ == "servo") {
     servo_sub_ = create_subscription<Float64>(
       "sensors/servo_position_command", 10, std::bind(&VescToOdom::servoCmdCallback, this, _1));
+  } else if (heading_source_ == "imu") {
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+      "imu/data", 10, std::bind(&VescToOdom::imuCallback, this, _1));
   }
 }
 
 void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 {
   // check that we have a last servo command if we are depending on it for angular velocity
-  if (use_servo_cmd_ && !last_servo_cmd_) {
+  if (heading_source_ == "servo" && !last_servo_cmd_) {
+    return;
+  }
+
+  // If using IMU, wait for first reading
+  if (heading_source_ == "imu" && !got_initial_imu_) {
     return;
   }
 
@@ -109,7 +122,7 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
     current_speed = 0.0;
   }
   double current_steering_angle(0.0), current_angular_velocity(0.0);
-  if (use_servo_cmd_) {
+  if (heading_source_ == "servo") {
     current_steering_angle =
       (last_servo_cmd_->data - steering_to_servo_offset_) / steering_to_servo_gain_;
     current_angular_velocity = current_speed * tan(current_steering_angle) / wheelbase_;
@@ -117,7 +130,14 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 
   // use current state as last state if this is our first time here
   if (!last_state_) {
+    if (heading_source_ == "imu") {
+      initial_imu_yaw_ = last_imu_yaw_;
+      got_initial_imu_ = true;
+      yaw_ = 0.0;
+      last_yaw_rad_ = 0.0;
+    }
     last_state_ = state;
+    return;
   }
 
   // calc elapsed time
@@ -125,13 +145,29 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 
   /** @todo could probably do better propigating odometry, e.g. trapezoidal integration */
 
+  if (heading_source_ == "imu") {
+    double current_yaw = last_imu_yaw_ - initial_imu_yaw_;
+    // normalize angle
+    current_yaw = atan2(sin(current_yaw), cos(current_yaw));
+    
+    current_angular_velocity = last_imu_angular_vel_z_;
+    yaw_ = current_yaw;
+    last_yaw_rad_ = current_yaw;
+  }
+
   // propigate odometry
   double x_dot = current_speed * cos(yaw_);
   double y_dot = current_speed * sin(yaw_);
   x_ += x_dot * dt.seconds();
   y_ += y_dot * dt.seconds();
-  if (use_servo_cmd_) {
+  
+  if (heading_source_ == "servo") {
     yaw_ += current_angular_velocity * dt.seconds();
+    // normalize yaw
+    yaw_ = atan2(sin(yaw_), cos(yaw_));
+  } else if (heading_source_ == "none") {
+    yaw_ = 0.0;
+    current_angular_velocity = 0.0;
   }
 
   // save state for next time
@@ -188,6 +224,17 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 void VescToOdom::servoCmdCallback(const Float64::SharedPtr servo)
 {
   last_servo_cmd_ = servo;
+}
+
+void VescToOdom::imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
+{
+  auto q = msg->orientation;
+  last_imu_yaw_ = atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+  last_imu_angular_vel_z_ = msg->angular_velocity.z;
+  if (!got_initial_imu_) {
+    initial_imu_yaw_ = last_imu_yaw_;
+    got_initial_imu_ = true;
+  }
 }
 
 }  // namespace vesc_ackermann
